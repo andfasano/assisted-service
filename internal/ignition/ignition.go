@@ -2,7 +2,10 @@ package ignition
 
 import (
 	"encoding/json"
+	"fmt"
+	"net/url"
 	"os"
+	"path/filepath"
 
 	"github.com/coreos/ignition/v2/config/merge"
 	config_31 "github.com/coreos/ignition/v2/config/v3_1"
@@ -10,7 +13,12 @@ import (
 	config_latest_trans "github.com/coreos/ignition/v2/config/v3_2/translate"
 	config_latest_types "github.com/coreos/ignition/v2/config/v3_2/types"
 	"github.com/coreos/vcontext/report"
+	"github.com/go-openapi/swag"
+	"github.com/openshift/assisted-service/internal/common"
+	"github.com/openshift/assisted-service/internal/host/hostutil"
+	"github.com/openshift/assisted-service/models"
 	"github.com/pkg/errors"
+	"golang.org/x/sync/errgroup"
 )
 
 // ParseToLatest takes the Ignition config and tries to parse it as v3.2 and if that fails,
@@ -81,6 +89,107 @@ func setFileInIgnition(config *config_latest_types.Config, filePath string, file
 		file.FileEmbedded1.Contents = config_latest_types.Resource{}
 	}
 	config.Storage.Files = append(config.Storage.Files, file)
+}
+
+//lint:ignore U1000 Ignore unused function
+//nolint:unused,deadcode
+func setUnitInIgnition(config *config_latest_types.Config, contents, name string, enabled bool) {
+	newUnit := config_latest_types.Unit{
+		Contents: swag.String(contents),
+		Name:     name,
+		Enabled:  swag.Bool(enabled),
+	}
+	config.Systemd.Units = append(config.Systemd.Units, newUnit)
+}
+
+func setCACertInIgnition(role models.HostRole, path string, workDir string, caCertFile string) error {
+	config, err := parseIgnitionFile(path)
+	if err != nil {
+		return err
+	}
+
+	var caCertData []byte
+	caCertData, err = os.ReadFile(caCertFile)
+	if err != nil {
+		return err
+	}
+
+	setFileInIgnition(config, common.HostCACertPath, fmt.Sprintf("data:,%s", url.PathEscape(string(caCertData))), false, 420, false)
+
+	fileName := fmt.Sprintf("%s.ign", role)
+	err = writeIgnitionFile(filepath.Join(workDir, fileName), config)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func HasCACertInIgnition(contents string) bool {
+	config, err := ParseToLatest([]byte(contents))
+	if err != nil {
+		return false
+	}
+	return len(config.Ignition.Security.TLS.CertificateAuthorities) > 0
+}
+
+func writeHostFiles(hosts []*models.Host, baseFile string, workDir string) error {
+	g := new(errgroup.Group)
+	for i := range hosts {
+		host := hosts[i]
+		g.Go(func() error {
+			config, err := parseIgnitionFile(filepath.Join(workDir, baseFile))
+			if err != nil {
+				return err
+			}
+
+			hostname, err := hostutil.GetCurrentHostName(host)
+			if err != nil {
+				return errors.Wrapf(err, "failed to get hostname for host %s", host.ID)
+			}
+
+			setFileInIgnition(config, "/etc/hostname", fmt.Sprintf("data:,%s", hostname), false, 420, true)
+
+			configBytes, err := json.Marshal(config)
+			if err != nil {
+				return err
+			}
+
+			if host.IgnitionConfigOverrides != "" {
+				merged, mergeErr := MergeIgnitionConfig(configBytes, []byte(host.IgnitionConfigOverrides))
+				if mergeErr != nil {
+					return errors.Wrapf(mergeErr, "failed to apply ignition config overrides for host %s", host.ID)
+				}
+				configBytes = []byte(merged)
+			}
+
+			err = os.WriteFile(filepath.Join(workDir, hostutil.IgnitionFileName(host)), configBytes, 0600)
+			if err != nil {
+				return errors.Wrapf(err, "failed to write ignition for host %s", host.ID)
+			}
+
+			return nil
+		})
+	}
+
+	return g.Wait()
+}
+
+// createHostIgnitions builds an ignition file for each host in the cluster based on the generated <role>.ign file
+func (g *installerGenerator) createHostIgnitions() error {
+	masters, workers := sortHosts(g.cluster.Hosts)
+
+	err := writeHostFiles(masters, masterIgn, g.workDir)
+	if err != nil {
+		return errors.Wrapf(err, "error writing master host ignition files")
+	}
+
+	err = writeHostFiles(workers, workerIgn, g.workDir)
+	if err != nil {
+		return errors.Wrapf(err, "error writing worker host ignition files")
+	}
+
+	return nil
 }
 
 func MergeIgnitionConfig(base []byte, overrides []byte) (string, error) {
